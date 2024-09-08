@@ -1,0 +1,4 @@
+prompt_toolkit
+argparse
+opencv-python
+Pillow
