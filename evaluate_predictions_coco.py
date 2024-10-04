@@ -37,9 +37,9 @@ def calculate_map(predictions_file, ground_truth_file):
     
     # Load predictions and convert to COCO format
     predictions = load_json(predictions_file)
-    coco_dt = COCO()
-    coco_dt.dataset = convert_annotations_to_coco_format(predictions)
-    coco_dt.createIndex()
+    coco_dt = COCO(predictions_file)
+#   coco_dt.dataset = convert_annotations_to_coco_format(predictions)
+#   coco_dt.createIndex()
 
     # Run COCO evaluation
     coco_eval = COCOeval(coco_gt, coco_dt, iouType='bbox')
@@ -49,18 +49,20 @@ def calculate_map(predictions_file, ground_truth_file):
     return coco_eval
 
 def plot_precision_recall(coco_eval, categories):
-    """Plot Precision-Recall curve."""
+    """Plot Precision-Recall as an x-y coordinate chart."""
     precisions = coco_eval.eval['precision']
     
-    # Plotting
+    # Create the plot for x (recall) and y (precision) coordinates
     plt.figure(figsize=(10, 8))
+    
     for idx, cat in enumerate(categories):
         precision = precisions[:, :, idx, 0, -1]
         precision = precision[precision > -1]
         recall = np.linspace(0, 1, num=precision.size)
         
         if precision.size > 0:
-            plt.plot(recall, precision, label=cat['name'])
+            # Plot recall (x-axis) vs precision (y-axis) with markers
+            plt.plot(recall, precision, marker='o', label=cat['name'], linestyle='-', markersize=5)
         else:
             print(f"Warning: No valid precision-recall data for category {cat['name']}")
 
@@ -122,3 +124,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args.predictions, args.ground_truth)
+
