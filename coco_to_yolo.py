@@ -22,23 +22,36 @@ def coco_to_yolo(coco_annotation_file, output_dir, image_dir):
 
         # Load image
         img = cv2.imread(image_path)
+        img_height, img_width = img.shape[:2]
 
-        # Create YOLO annotation file
-        yolo_file = os.path.join(output_dir, file_name.replace('.jpg', '.txt'))
-        with open(yolo_file, 'w') as f:
-            for annotation in coco_data['annotations']:
-                if annotation['image_id'] == image_id:
-                    x, y, w, h = annotation['bbox']
-                    class_id = annotation['category_id'] - class_id_difference
+        valid_bboxes = []
 
-                    # Convert COCO bounding box format to YOLO format
-                    center_x = (x + w / 2) / img.shape[1]
-                    center_y = (y + h / 2) / img.shape[0]
-                    relative_width = w / img.shape[1]
-                    relative_height = h / img.shape[0]
+        # Check annotations for the current image
+        for annotation in coco_data['annotations']:
+            if annotation['image_id'] == image_id:
+                x, y, w, h = annotation['bbox']
+                class_id = annotation['category_id'] - class_id_difference
 
-                    # Write YOLO annotation to file
-                    f.write(f"{class_id} {center_x} {center_y} {relative_width} {relative_height}\n")
+                # Convert COCO bounding box format to YOLO format
+                center_x = (x + w / 2) / img_width
+                center_y = (y + h / 2) / img_height
+                relative_width = w / img_width
+                relative_height = h / img_height
+
+                # Ignore boxes if center coords are > 1 or if they exceed image dimensions
+                if center_x > 1 or center_y > 1:
+                    continue
+                if (x + w) > img_width or (y + h) > img_height:
+                    continue
+
+                # Add valid bbox to the list
+                valid_bboxes.append(f"{class_id} {center_x} {center_y} {relative_width} {relative_height}\n")
+
+        # Write YOLO annotation file only if there are valid bboxes
+        if valid_bboxes:
+            yolo_file = os.path.join(output_dir, file_name.replace('.jpg', '.txt'))
+            with open(yolo_file, 'w') as f:
+                f.writelines(valid_bboxes)
 
 def main():
     parser = argparse.ArgumentParser(description="Convert COCO annotations to YOLO format")
