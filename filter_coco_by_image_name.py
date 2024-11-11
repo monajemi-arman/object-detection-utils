@@ -45,4 +45,4 @@ data['annotations'] = new_annotations
 
 # Save to output JSON
 with open(output_json, 'w') as f:
-    json.dump(data, 'output.json')
+    json.dump(data, f)
