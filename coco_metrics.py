@@ -6,6 +6,9 @@ import numpy as np
 import tempfile
 import csv
 import os
+from contextlib import redirect_stdout
+from io import StringIO
+from tabulate import tabulate
 
 
 def compute_iou(bbox1, bbox2):
@@ -43,7 +46,9 @@ def validate_bbox_format(bbox, source="unknown"):
     return True
 
 
-def compute_per_image_metrics(coco_gt, coco_pred, img_id, iou_threshold, compute_agnostic=False):
+def compute_per_image_metrics(
+    coco_gt, coco_pred, img_id, iou_threshold, compute_agnostic=False
+):
     """Compute metrics for a single image, optionally class-agnostic."""
     gt_anns = coco_gt.loadAnns(coco_gt.getAnnIds(imgIds=img_id))
     pred_anns = coco_pred.loadAnns(coco_pred.getAnnIds(imgIds=img_id))
@@ -53,34 +58,47 @@ def compute_per_image_metrics(coco_gt, coco_pred, img_id, iou_threshold, compute
     FP = 0
     FN = 0
     class_error = 0
+    iou_list = []  # <-- track IoUs
 
     # Sort predictions by confidence (descending)
-    pred_anns_sorted = sorted(pred_anns, key=lambda x: x["score"], reverse=True)
-    matched_gt = set()
+    pred_anns_sorted = sorted(
+        pred_anns, key=lambda x: x.get("score", 1.0), reverse=True
+    )
+
+    # Track which GTs have at least one match
+    gt_matched = {gt["id"]: False for gt in gt_anns}
 
     for pred in pred_anns_sorted:
         best_iou = 0.0
         best_gt = None
         for gt in gt_anns:
-            if gt["id"] in matched_gt:
-                continue
             iou = compute_iou(pred["bbox"], gt["bbox"])
             if iou > best_iou:
                 best_iou = iou
                 best_gt = gt
 
+        iou_list.append(best_iou)  # log best IoU for this prediction
+
         if best_iou >= iou_threshold:
             if compute_agnostic or pred["category_id"] == best_gt["category_id"]:
-                TP += 1
-                matched_gt.add(best_gt["id"])
+                if not gt_matched[best_gt["id"]]:
+                    TP += 1
+                    gt_matched[best_gt["id"]] = True  # mark GT as detected
+                else:
+                    FP += 1  # duplicate detection of same GT
             else:
-                class_error += 1
-                FP += 1
+                # class mismatch → still count GT as detected, but log class error
+                if not gt_matched[best_gt["id"]]:
+                    gt_matched[best_gt["id"]] = True
+                    class_error += 1
+                    TP += 1
+                else:
+                    FP += 1
         else:
             FP += 1
 
-    # Count unmatched GTs as FN
-    FN = len(gt_anns) - len(matched_gt)
+    # Any GT never matched at all → FN
+    FN = sum(1 for matched in gt_matched.values() if not matched)
 
     # Calculate metrics
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
@@ -110,22 +128,45 @@ def compute_per_image_metrics(coco_gt, coco_pred, img_id, iou_threshold, compute
         "cls_accuracy": cls_accuracy,
         "detection_accuracy": detection_accuracy,
         "mAP_50": map_50,
-        "mAP_75": map_75
+        "mAP_75": map_75,
+        "ious": iou_list,
     }
 
 
 def write_csv_results(results, csv_path):
     """Write per-image results to a CSV file."""
     headers = [
-        "image_id", "gt_count", "pred_count", "TP", "FP", "FN", "class_error",
-        "precision", "recall", "cls_accuracy", "detection_accuracy",
-        "mAP_50", "mAP_75"
+        "image_id",
+        "gt_count",
+        "pred_count",
+        "TP",
+        "FP",
+        "FN",
+        "class_error",
+        "precision",
+        "recall",
+        "cls_accuracy",
+        "detection_accuracy",
+        "mAP_50",
+        "mAP_75",
+        "ious",
     ]
-    with open(csv_path, 'w', newline='') as f:
+    with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for result in results:
-            writer.writerow(result)
+            row = result.copy()
+            # Convert IoUs list into a string like "0.712;0.423;0.000"
+            row["ious"] = ";".join([f"{x:.3f}" for x in result.get("ious", [])])
+            writer.writerow(row)
+
+
+def silent_coco_summarize(coco_eval):
+    """Run COCOeval.summarize() without printing output."""
+    buf = StringIO()
+    with redirect_stdout(buf):
+        coco_eval.summarize()
+    return buf.getvalue()
 
 
 def main(args):
@@ -154,11 +195,17 @@ def main(args):
         validate_bbox_format(ann["bbox"], "predictions")
 
     # Filter out low-confidence predictions
-    filtered_preds = [ann for ann in filtered_preds if ann.get("score", 1.0) >= args.confidence]
-    print(f"Predictions after confidence filtering (>= {args.confidence}): {len(filtered_preds)}")
+    filtered_preds = [
+        ann for ann in filtered_preds if ann.get("score", 1.0) >= args.confidence
+    ]
+    print(
+        f"Predictions after confidence filtering (>= {args.confidence}): {len(filtered_preds)}"
+    )
 
     if not filtered_preds:
-        print("No valid predictions found that match ground truth images or pass confidence threshold.")
+        print(
+            "No valid predictions found that match ground truth images or pass confidence threshold."
+        )
         return
 
     # Load filtered predictions into COCO API
@@ -180,7 +227,9 @@ def main(args):
 
     for img_id in coco_gt.getImgIds():
         # Standard metrics
-        result = compute_per_image_metrics(coco_gt, coco_pred, img_id, args.iou_threshold)
+        result = compute_per_image_metrics(
+            coco_gt, coco_pred, img_id, args.iou_threshold
+        )
         per_image_results.append(result)
         TP += result["TP"]
         FP += result["FP"]
@@ -188,8 +237,12 @@ def main(args):
         class_error += result["class_error"]
 
         # Class-agnostic metrics
-        result_agnostic = compute_per_image_metrics(coco_gt, coco_pred, img_id, args.iou_threshold, compute_agnostic=True)
-        per_image_agnostic_results.append({**result_agnostic, "image_id": f"{img_id}_agnostic"})
+        result_agnostic = compute_per_image_metrics(
+            coco_gt, coco_pred, img_id, args.iou_threshold, compute_agnostic=True
+        )
+        per_image_agnostic_results.append(
+            {**result_agnostic, "image_id": f"{img_id}_agnostic"}
+        )
         TP_agnostic += result_agnostic["TP"]
         FP_agnostic += result_agnostic["FP"]
         FN_agnostic += result_agnostic["FN"]
@@ -209,27 +262,40 @@ def main(args):
     coco_eval = COCOeval(coco_gt, coco_pred, "bbox")
     coco_eval.evaluate()
     coco_eval.accumulate()
-    coco_eval.summarize()
+    silent_coco_summarize(coco_eval)
     map_50 = coco_eval.stats[0] if coco_eval.stats[0] >= 0 else 0.0
     map_75 = coco_eval.stats[1] if coco_eval.stats[1] >= 0 else 0.0
 
-    # Output aggregate results
-    print("\nAggregate Evaluation Metrics:")
-    print(f"mAP@0.5: {map_50:.4f}")
-    print(f"mAP@0.75: {map_75:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Classification Accuracy: {cls_accuracy:.4f}")
-    print(f"Detection Accuracy: {detection_accuracy:.4f}")
-    print(f"True Positives (TP): {TP}")
-    print(f"False Positives (FP): {FP}")
-    print(f"False Negatives (FN): {FN}")
-    print(f"Classification Errors: {class_error}")
+    # Prepare aggregate results for table
+    table_data = [
+        ["mAP@0.5", f"{map_50:.4f}"],
+        ["mAP@0.75", f"{map_75:.4f}"],
+        ["Precision", f"{precision:.4f}"],
+        ["Recall", f"{recall:.4f}"],
+        ["Classification Accuracy", f"{cls_accuracy:.4f}"],
+        ["Detection Accuracy", f"{detection_accuracy:.4f}"],
+        ["True Positives (TP)", TP],
+        ["False Positives (FP)", FP],
+        ["False Negatives (FN)", FN],
+        ["Classification Errors", class_error],
+    ]
 
     # --- Class-agnostic aggregate metrics ---
-    precision_agnostic = TP_agnostic / (TP_agnostic + FP_agnostic) if (TP_agnostic + FP_agnostic) > 0 else 0
-    recall_agnostic = TP_agnostic / (TP_agnostic + FN_agnostic) if (TP_agnostic + FN_agnostic) > 0 else 0
-    detection_accuracy_agnostic = TP_agnostic / (TP_agnostic + FP_agnostic + FN_agnostic) if (TP_agnostic + FP_agnostic + FN_agnostic) > 0 else 0
+    precision_agnostic = (
+        TP_agnostic / (TP_agnostic + FP_agnostic)
+        if (TP_agnostic + FP_agnostic) > 0
+        else 0
+    )
+    recall_agnostic = (
+        TP_agnostic / (TP_agnostic + FN_agnostic)
+        if (TP_agnostic + FN_agnostic) > 0
+        else 0
+    )
+    detection_accuracy_agnostic = (
+        TP_agnostic / (TP_agnostic + FP_agnostic + FN_agnostic)
+        if (TP_agnostic + FP_agnostic + FN_agnostic) > 0
+        else 0
+    )
 
     # --- Class-agnostic mAP ---
     def map_to_one_category(anns):
@@ -247,13 +313,13 @@ def main(args):
     print("Ground truth dataset keys:", gt_dict.keys())
 
     # Build new COCO objects using tempfile
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as gt_temp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as gt_temp:
         json.dump(gt_dict, gt_temp)
         gt_temp.flush()
         coco_gt_agnostic = COCO(gt_temp.name)
 
     pred_anns = map_to_one_category(filtered_preds)
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as pred_temp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as pred_temp:
         json.dump(pred_anns, pred_temp)
         pred_temp.flush()
         coco_pred_agnostic = coco_gt_agnostic.loadRes(pred_temp.name)
@@ -261,16 +327,26 @@ def main(args):
     coco_eval_agnostic = COCOeval(coco_gt_agnostic, coco_pred_agnostic, "bbox")
     coco_eval_agnostic.evaluate()
     coco_eval_agnostic.accumulate()
-    coco_eval_agnostic.summarize()
-    map_50_agnostic = coco_eval_agnostic.stats[0] if coco_eval_agnostic.stats[0] >= 0 else 0.0
-    map_75_agnostic = coco_eval_agnostic.stats[1] if coco_eval_agnostic.stats[1] >= 0 else 0.0
+    silent_coco_summarize(coco_eval_agnostic)
+    map_50_agnostic = (
+        coco_eval_agnostic.stats[0] if coco_eval_agnostic.stats[0] >= 0 else 0.0
+    )
+    map_75_agnostic = (
+        coco_eval_agnostic.stats[1] if coco_eval_agnostic.stats[1] >= 0 else 0.0
+    )
 
+    table_data_agnostic = [
+        ["Class-agnostic mAP@0.5", f"{map_50_agnostic:.4f}"],
+        ["Class-agnostic mAP@0.75", f"{map_75_agnostic:.4f}"],
+        ["Class-agnostic Precision", f"{precision_agnostic:.4f}"],
+        ["Class-agnostic Recall", f"{recall_agnostic:.4f}"],
+        ["Class-agnostic Detection Accuracy", f"{detection_accuracy_agnostic:.4f}"],
+    ]
+
+    print("\nAggregate Evaluation Metrics:")
+    print(tabulate(table_data, headers=["Metric", "Value"], tablefmt="github"))
     print("\nAggregate Class-agnostic Detection Metrics (ignore class):")
-    print(f"Precision: {precision_agnostic:.4f}")
-    print(f"Recall: {recall_agnostic:.4f}")
-    print(f"Detection Accuracy: {detection_accuracy_agnostic:.4f}")
-    print(f"Class-agnostic mAP@0.5: {map_50_agnostic:.4f}")
-    print(f"Class-agnostic mAP@0.75: {map_75_agnostic:.4f}")
+    print(tabulate(table_data_agnostic, headers=["Metric", "Value"], tablefmt="github"))
 
 
 if __name__ == "__main__":
